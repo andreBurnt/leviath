@@ -221,6 +221,16 @@ same list.
 
 ### Fixed
 
+- Under the default `shell_env = "filtered"`, every git command in a shell tool
+  failed with `missing config key GIT_CONFIG_KEY_0` when the daemon's
+  environment carried git's `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` /
+  `GIT_CONFIG_VALUE_n` set (which `actions/checkout` leaves behind): the bare
+  `KEY` hint withheld `KEY_n` and let `COUNT` and `VALUE_n` through, and git
+  reads the three as one set. The set is now withheld together, whichever
+  member the heuristic caught, rather than `KEY_n` exempted: on a GitHub
+  Actions runner `VALUE_n` is the `http.extraheader` carrying the repository
+  token. Listing the `GIT_CONFIG_KEY_n` names in `allow_env_vars` hands the set
+  over.
 - A tool approval prompt names only the commands that still need approving.
   A line that ran `cd`, `cat`, `ls` and one `sed` read `Allow cat x, cd, echo
   +4 more`, with `sed` hidden in the count, and a stage or run grant also

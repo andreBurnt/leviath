@@ -335,6 +335,12 @@ pub enum ShellEnvMode {
 /// `allow_env_vars` wins under every mode. It already means "yes, this agent is
 /// meant to have that" for a Rhai `env_var` read, and one list with one meaning
 /// is worth more than a second list that means almost the same thing.
+///
+/// One set of names is decided together rather than one at a time: git's
+/// `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, see
+/// `is_git_config_set_member`. If any member is withheld after the per-name
+/// decision, all of them are - which is also why listing a lone `VALUE_n` in
+/// `allow_env_vars` while its `KEY_n` is withheld hands nothing over.
 pub fn withheld_child_vars<'a>(
     names: impl Iterator<Item = &'a str>,
     mode: ShellEnvMode,
@@ -342,17 +348,51 @@ pub fn withheld_child_vars<'a>(
     custom_withhold: &[String],
 ) -> Vec<String> {
     let listed = |list: &[String], name: &str| list.iter().any(|e| e.eq_ignore_ascii_case(name));
-    names
-        .filter(|name| match mode {
-            ShellEnvMode::Inherit => false,
-            ShellEnvMode::Custom => listed(custom_withhold, name) && !listed(allow_env_vars, name),
-            ShellEnvMode::Filtered if name.eq_ignore_ascii_case("SSH_AUTH_SOCK") => false,
-            ShellEnvMode::Filtered | ShellEnvMode::Strict => {
-                !script_env_allowed(name, allow_env_vars)
-            }
+    let decided: Vec<(&str, bool)> = names
+        .map(|name| {
+            let withhold = match mode {
+                ShellEnvMode::Inherit => false,
+                ShellEnvMode::Custom => {
+                    listed(custom_withhold, name) && !listed(allow_env_vars, name)
+                }
+                ShellEnvMode::Filtered if name.eq_ignore_ascii_case("SSH_AUTH_SOCK") => false,
+                ShellEnvMode::Filtered | ShellEnvMode::Strict => {
+                    !script_env_allowed(name, allow_env_vars)
+                }
+            };
+            (name, withhold)
         })
-        .map(str::to_string)
+        .collect();
+    let git_config_set_withheld = decided
+        .iter()
+        .any(|(name, withhold)| *withhold && is_git_config_set_member(name));
+    decided
+        .into_iter()
+        .filter(|(name, withhold)| {
+            *withhold || (git_config_set_withheld && is_git_config_set_member(name))
+        })
+        .map(|(name, _)| name.to_string())
         .collect()
+}
+
+/// Whether `name` is one of the variables git reads as a single set.
+///
+/// `GIT_CONFIG_COUNT=n` tells git to apply `GIT_CONFIG_KEY_0..n` /
+/// `GIT_CONFIG_VALUE_0..n` as command-line config, and a set with a member
+/// missing is an error, not a smaller set: `missing config key
+/// GIT_CONFIG_KEY_0`, from every git command. The bare `KEY` hint catches
+/// `KEY_n` and nothing else, so the filter used to hand git exactly that
+/// broken shape.
+///
+/// Withholding the whole set is the right repair, not exempting `KEY_n`: this
+/// is how `actions/checkout` passes the repository token to git, as an
+/// `http.extraheader` in `VALUE_n`, so on a GitHub Actions runner `VALUE_n` is
+/// the credential and `KEY_n` only its label.
+fn is_git_config_set_member(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "GIT_CONFIG_COUNT"
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
 /// Whether `name` looks like it holds a credential.
@@ -508,10 +548,42 @@ mod tests {
     ];
 
     fn withheld(mode: ShellEnvMode, allow: &[&str], custom: &[&str]) -> Vec<String> {
+        withheld_from(SAMPLE_ENV, mode, allow, custom)
+    }
+
+    fn withheld_from(
+        env: &[&str],
+        mode: ShellEnvMode,
+        allow: &[&str],
+        custom: &[&str],
+    ) -> Vec<String> {
         let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
         let custom: Vec<String> = custom.iter().map(|s| s.to_string()).collect();
-        withheld_child_vars(SAMPLE_ENV.iter().copied(), mode, &allow, &custom)
+        withheld_child_vars(env.iter().copied(), mode, &allow, &custom)
     }
+
+    /// What `actions/checkout` leaves in the environment of every later step:
+    /// the repository token as an `http.extraheader`, handed to git through
+    /// the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` set.
+    /// Interleaved with ordinary names so the set's members are not adjacent.
+    const GIT_CONFIG_ENV: &[&str] = &[
+        "GIT_CONFIG_COUNT",
+        "PATH",
+        "GIT_CONFIG_KEY_0",
+        "HOME",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
+        "TERM",
+    ];
+
+    const GIT_CONFIG_SET: &[&str] = &[
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
+    ];
 
     /// The default. Credentials are withheld, every toolchain variable passes,
     /// and `SSH_AUTH_SOCK` is the deliberate carve-out that lets this be the
@@ -593,6 +665,73 @@ mod tests {
             );
             assert!(!out.iter().any(|n| n == "HOME"), "{mode:?}");
         }
+    }
+
+    /// Git reads `GIT_CONFIG_COUNT` and every `GIT_CONFIG_KEY_n` /
+    /// `GIT_CONFIG_VALUE_n` as one set. `KEY_n` alone was withheld (the bare
+    /// `KEY` hint), `COUNT` and `VALUE_n` passed, and every git command in the
+    /// shell tool then failed with `missing config key GIT_CONFIG_KEY_0`. The
+    /// honest answer is not to pass `KEY_n`: in GitHub Actions `VALUE_n` is an
+    /// `http.extraheader` carrying the repository token. So the set goes
+    /// together, whichever member the heuristic caught.
+    #[test]
+    fn the_git_config_set_is_withheld_as_one() {
+        for mode in [ShellEnvMode::Filtered, ShellEnvMode::Strict] {
+            let out = withheld_from(GIT_CONFIG_ENV, mode, &[], &[]);
+            for member in GIT_CONFIG_SET {
+                assert!(
+                    out.iter().any(|n| n == member),
+                    "{mode:?}: {member} must be withheld with the rest of the set"
+                );
+            }
+            for kept in ["PATH", "HOME", "TERM"] {
+                assert!(!out.iter().any(|n| n == kept), "{mode:?}: {kept}");
+            }
+        }
+    }
+
+    /// `custom` names one member and gets the set, in the environment's order:
+    /// a hand-written list that splits git's set is the same breakage, and the
+    /// caller's order is the caller's business.
+    #[test]
+    fn custom_naming_one_member_withholds_the_git_config_set() {
+        let out = withheld_from(GIT_CONFIG_ENV, ShellEnvMode::Custom, &[], &["git_config_value_1"]);
+        assert_eq!(out, GIT_CONFIG_SET);
+    }
+
+    /// `GIT_CONFIG_COUNT=0` is a complete set on its own, and the rule only
+    /// fires when a member is withheld: with nothing to hide, nothing is.
+    #[test]
+    fn a_git_config_count_with_no_entries_passes() {
+        let out = withheld_from(&["GIT_CONFIG_COUNT", "PATH"], ShellEnvMode::Filtered, &[], &[]);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// `allow_env_vars` still wins: listing the `KEY_n` names, the only members
+    /// the heuristic catches, hands the whole set over.
+    #[test]
+    fn allowlisting_the_git_config_keys_hands_the_set_over() {
+        let out = withheld_from(
+            GIT_CONFIG_ENV,
+            ShellEnvMode::Filtered,
+            &["GIT_CONFIG_KEY_0", "git_config_key_1"],
+            &[],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// Listing only a `VALUE_n` while its `KEY_n` is still withheld hands
+    /// nothing over. The set is what git needs, and a `VALUE_n` on its own is
+    /// exactly the partial set this rule exists to prevent.
+    #[test]
+    fn allowlisting_a_lone_git_config_value_does_not_split_the_set() {
+        let out = withheld_from(
+            GIT_CONFIG_ENV,
+            ShellEnvMode::Filtered,
+            &["GIT_CONFIG_VALUE_0"],
+            &[],
+        );
+        assert_eq!(out, GIT_CONFIG_SET);
     }
 
     /// The names a cloned repository must not be able to set. Each one decides

@@ -623,6 +623,11 @@ commands need. Toolchain variables pass through under every mode: `PATH`, `HOME`
 `JAVA_HOME`, `VIRTUAL_ENV`, `NVM_DIR`, `GOPATH`, `DOCKER_HOST`, `TERM`. `allow_env_vars` hands a
 specific name over under every mode too, so one list means one thing whichever surface asks.
 
+Git's `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` are withheld together: git
+reads them as one set and fails on a partial one, and a `VALUE_n` can be an `http.extraheader`
+carrying a token (that is how `actions/checkout` hands git its credential). List the `GIT_CONFIG_KEY_n`
+names in `allow_env_vars` to hand the set over.
+
 ```toml
 [security]
 shell_env          = "custom"
